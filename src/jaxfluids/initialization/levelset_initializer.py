@@ -140,10 +140,10 @@ class LevelsetInitializer:
         is_parallel = self.domain_information.is_parallel
         is_h5_file = self.initial_condition_levelset.is_h5_file
 
-        if is_restart:
-            levelset_fields = self.from_restart_file()
+        # if is_restart:
+        #     levelset_fields = self.from_restart_file()
 
-        elif is_h5_file:
+        if is_h5_file:
             levelset_fields = self.from_h5_file()
             
         elif user_levelset_init is not None:
@@ -232,7 +232,7 @@ class LevelsetInitializer:
         levelset_model = self.equation_information.levelset_model
         restart_file_path = self.restart_setup.file_path
         is_equal_decomposition = self.restart_setup.is_equal_decomposition
-
+        
         # LOAD H5 FILE
         h5file_basename = os.path.split(restart_file_path)[-1]
         if "proc" in h5file_basename:
