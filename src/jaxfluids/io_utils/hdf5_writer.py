@@ -67,6 +67,8 @@ class HDF5Writer():
             domain_information.active_axes_indices)
         
         self.laplacian = Laplacian(DICT_SECOND_DERIVATIVE_CENTER["CENTRAL2"], domain_information)
+
+        self.diff = 0.0
     
     def set_save_path_domain(self, save_path_domain: str) -> None:
         self.save_path_domain = save_path_domain
@@ -246,6 +248,9 @@ class HDF5Writer():
                     h5file["forcings"].create_group(name="turb_hit")
                     ek_ref = forcing_parameters.hit_ek_ref
                     h5file["forcings/turb_hit"].create_dataset(name="ek_ref", data=ek_ref, dtype=dtype)
+
+            h5file.create_dataset(name="diff", data=self.diff, dtype="f8")
+            h5file.create_dataset(name="step", data=time_control_variables.simulation_step, dtype="i8")
 
     def _prepare_material_field_buffer_for_h5dump(
             self,

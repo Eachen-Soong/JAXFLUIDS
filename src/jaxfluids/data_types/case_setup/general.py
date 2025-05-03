@@ -11,3 +11,5 @@ class GeneralSetup(NamedTuple):
     save_timestamps: np.ndarray
     save_start: float
     convergence_tol: float = 0.
+    running_diff_cnt: int = 16
+

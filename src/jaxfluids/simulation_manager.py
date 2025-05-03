@@ -73,6 +73,8 @@ class SimulationManager:
 
         # ADAPTATION: judge convergence and stop in advance
         self.convergence_tol = self.case_setup.general_setup.convergence_tol
+        self.running_diff_cnt = self.case_setup.general_setup.running_diff_cnt
+        self.diff_buffer = []
 
         time_integrator = self.numerical_setup.conservatives.time_integration.integrator
         self.time_integrator: TimeIntegrator = time_integrator(
@@ -164,7 +166,7 @@ class SimulationManager:
                 halo_manager        = self.halo_manager,
                 logger              = self.logger,
                 output_writer       = self.output_writer)
-
+            
     def simulate(
             self,
             simulation_buffers: SimulationBuffers,
@@ -266,7 +268,7 @@ class SimulationManager:
 
     def calc_rel_l2(self, buffer1: MaterialFieldBuffers, buffer2: MaterialFieldBuffers):
         # primitives <KeysViewHDF5 ['density', 'pressure', 'velocity']>
-        if buffer1 == None or buffer2 == None:
+        if buffer1 is None or buffer2 is None:
             return np.inf
         loss = jnp.mean(jnp.square(buffer1.primitives-buffer2.primitives)) / jnp.mean(jnp.square(buffer1.primitives))
         return loss
@@ -354,8 +356,14 @@ class SimulationManager:
                 time_control_variables.simulation_step)
 
             diff = self.calc_rel_l2(prev_buffer, simulation_buffers.material_fields)
-            convergence_flag = (diff <= self.convergence_tol)
-            print(f"diff: {diff}")
+            self.diff_buffer.append(diff)
+            if len(self.diff_buffer) >= self.running_diff_cnt:
+                self.diff_buffer.pop(0)
+            running_diff = sum(self.diff_buffer) / len(self.diff_buffer)
+            self.output_writer.hdf5_writer.diff = running_diff
+            
+            convergence_flag = (running_diff <= self.convergence_tol)
+            print(f"diff: {diff}; running_diff: {running_diff}")
 
             # LOG TERMINAL END TIME STEP
             self.logger.log_end_time_step(
@@ -374,7 +382,12 @@ class SimulationManager:
 
         # CALLBACK on_simulation_end
         # buffer_dictionary = self._callback("on_simulation_end",
-        #   buffer_dictionary=buffer_dictionary)
+        #                                         buffer_dictionary=buffer_dictionary)
+        self.diff_buffer.append(diff)
+        if len(self.diff_buffer) >= self.running_diff_cnt:
+            self.diff_buffer.pop(0)
+        running_diff = sum(self.diff_buffer) / len(self.diff_buffer)
+        self.output_writer.hdf5_writer.diff = running_diff
 
         # FINAL OUTPUT
         self.output_writer.write_output(
