@@ -132,7 +132,6 @@ class QuantityExtender:
         :return: _description_
         :rtype: Tuple[Array, float]
         """
-        assert force_steps
 
         is_jaxforloop = self.extension_setup.is_jaxforloop
         is_jaxhileloop = self.extension_setup.is_jaxhileloop
@@ -142,121 +141,95 @@ class QuantityExtender:
         smallest_cell_size = self.domain_information.smallest_cell_size
         fictitious_timestep_size = smallest_cell_size * CFL
 
-        # Common body function for both fori_loop and while_loop
-        def _scan_body_func_fori(carry, _) -> Tuple[Tuple[Array, Array], None]:
-            current_quantity, current_directional_derivative = carry
-            quantity_out, _ = self.do_integration_step(
-                current_quantity, normal, mask, physical_simulation_time,
-                fictitious_timestep_size, current_directional_derivative
-            )
-            return (quantity_out, current_directional_derivative), None
-
-        def _scan_body_func_while(carry, _) -> Tuple[Tuple[Array, int, Array, Array], Tuple[Array, Array]]:
-            current_quantity, current_index, _, current_directional_derivative = carry
-            quantity_out, rhs = self.do_integration_step(
-                current_quantity, normal, mask, physical_simulation_time,
-                fictitious_timestep_size, current_directional_derivative
-            )
-            
-            denominator = jnp.sum(mask, axis=(-1,-2,-3))
-            mean_residual = jnp.sum(jnp.abs(rhs), axis=(-1,-2,-3))
-            if is_parallel:
-                mean_residual = jax.lax.psum(mean_residual, axis_name="i")
-                denominator = jax.lax.psum(denominator, axis_name="i")
-            mean_residual = mean_residual / (denominator + 1e-30) 
-            mean_residual = jnp.mean(mean_residual) # NOTE mean over primitives and phases
-
-            next_carry = (quantity_out, current_index + 1, mean_residual, current_directional_derivative)
-            output = (quantity_out, mean_residual) # Output the quantity and residual for debugging/analysis
-            return next_carry, output
-
-
         if is_jaxforloop:
+
+            def _body_func(index, args: Tuple[Array]) -> Tuple[Array]:
+                quantity, directional_derivative = args
+                if debug:
+                    quantity_in = quantity[index]
+                else:
+                    quantity_in = quantity
+                quantity_out, _ = self.do_integration_step(quantity_in, normal, mask, physical_simulation_time,
+                                                           fictitious_timestep_size, directional_derivative)
+                if debug:
+                    quantity = quantity.at[index+1].set(quantity_out)
+                else:
+                    quantity = quantity_out
+                args = (quantity, directional_derivative)
+                return args
+            
             if linear_extension:
                 directional_derivative = self.compute_directional_derivative(quantity, normal)
                 buffer = jnp.zeros_like(quantity)
                 directional_derivative = buffer.at[self.s_1].set(directional_derivative)
-                
-                # Perform scan for directional derivative extension
-                initial_carry_dd = (directional_derivative, None)
-                final_carry_dd, _ = jax.lax.scan(_scan_body_func_fori, initial_carry_dd, None, length=steps)
-                directional_derivative = final_carry_dd[0]
+                if debug:
+                    quantity_buffer = jnp.zeros((steps+1,)+directional_derivative.shape)
+                    directional_derivative = quantity_buffer.at[0].set(directional_derivative)
+                args = (directional_derivative, None)
+                args = jax.lax.fori_loop(0, steps, _body_func, args)
+                directional_derivative = args[0]
             else:
                 directional_derivative = None
 
-            # Perform scan for quantity extension
-            initial_carry_quantity = (quantity, directional_derivative)
-            final_carry_quantity, _ = jax.lax.scan(_scan_body_func_fori, initial_carry_quantity, None, length=steps)
-            quantity = final_carry_quantity[0]
+            if debug:
+                quantity_buffer = jnp.zeros((steps+1,)+quantity.shape)
+                quantity = quantity_buffer.at[0].set(quantity)
+                directional_derivative = directional_derivative[-1] if linear_extension else None
+            args = (quantity, directional_derivative)
+            args = jax.lax.fori_loop(0, steps, _body_func, args)
+            quantity = args[0]
             step_count = steps
 
         elif is_jaxhileloop:
+            def _body_func(args: Tuple[Array]) -> Tuple[Array]:
+                quantity, index, mean_residual, directional_derivative = args
+                if debug:
+                    quantity_in = quantity[index]
+                else:
+                    quantity_in = quantity
+                quantity_out, rhs = self.do_integration_step(quantity_in, normal, mask, physical_simulation_time,
+                                                           fictitious_timestep_size, directional_derivative)
+                denominator = jnp.sum(mask, axis=(-1,-2,-3))
+                mean_residual = jnp.sum(jnp.abs(rhs), axis=(-1,-2,-3))
+                if is_parallel:
+                    mean_residual = jax.lax.psum(mean_residual, axis_name="i")
+                    denominator = jax.lax.psum(denominator, axis_name="i")
+                mean_residual = mean_residual/(denominator + 1e-30) 
+                mean_residual = jnp.mean(mean_residual) # NOTE mean over primitives and phases
+                if debug:
+                    quantity = quantity.at[index+1].set(quantity_out)
+                else:
+                    quantity = quantity_out
+                args = (quantity, index+1, mean_residual, directional_derivative)
+                return args
+            
+            def _cond_fun(args: Tuple[int, Array, float]) -> bool:
+                _, index, mean_residual, _ = args
+                condition1 = mean_residual > residual_threshold if not force_steps else True
+                condition2 = index < steps
+                return jnp.logical_and(condition1, condition2)
+
             if linear_extension:
                 directional_derivative = self.compute_directional_derivative(quantity, normal)
                 buffer = jnp.zeros_like(quantity)
                 directional_derivative = buffer.at[self.s_1].set(directional_derivative)
-                
-                # JAX's while_loop doesn't directly support `scan`-like accumulation of intermediate states for debugging easily.
-                # If `debug` is true and you need intermediate steps for the directional derivative, you'd need to adapt.
-                # For simplicity here, we're assuming debug for `linear_extension` is less critical for the intermediate steps.
-                # If `force_steps` is True, it behaves like fori_loop, so we can use scan.
-                # Otherwise, a custom while_loop-like structure for scan is more complex or not directly supported.
-                # For `linear_extension` with `is_jaxhileloop`, if `force_steps` is False, the "steps" parameter is a limit, not a fixed number of iterations.
-                # This makes it less directly convertible to a simple `scan` where the number of iterations is fixed.
-                # For now, we'll keep the `fori_loop` structure for the directional derivative if `is_jaxhileloop` but `force_steps` is implied for its termination.
-                # This part would need careful consideration if `debug` and dynamic steps were strict requirements here.
-                initial_carry_dd = (directional_derivative, 0, 1e10, None)
-                # Since the number of steps for directional_derivative extension is fixed by `steps`, we can use scan
-                final_carry_dd, _ = jax.lax.scan(_scan_body_func_while, initial_carry_dd, None, length=steps)
-                directional_derivative = final_carry_dd[0]
+                if debug:
+                    quantity_buffer = jnp.zeros((steps+1,)+directional_derivative.shape)
+                    directional_derivative = quantity_buffer.at[0].set(directional_derivative)
+                args = (directional_derivative, 0, 1e10, None)
+                args = jax.lax.fori_loop(0, steps, _body_func, args)
+                directional_derivative = args[0]
             else:
                 directional_derivative = None
 
-            # For the main quantity extension with jax.lax.while_loop, we need to manually create the loop
-            # and potentially collect debug information. jax.lax.scan is generally for fixed iterations.
-            # However, if `force_steps` is True, `while_loop` effectively becomes a fixed-step loop,
-            # allowing for a `scan`-like approach for the main quantity extension.
-            
-            # If `force_steps` is True, we can use `scan` because the number of iterations is fixed.
-            if force_steps:
-                initial_carry_quantity = (quantity, 0, 1e10, directional_derivative)
-                final_carry_quantity, _ = jax.lax.scan(_scan_body_func_while, initial_carry_quantity, None, length=steps)
-                quantity = final_carry_quantity[0]
-                step_count = final_carry_quantity[1]
-            else:
-                # If `force_steps` is False, we need the traditional jax.lax.while_loop structure.
-                # Converting this directly to a single `scan` is not straightforward as `scan` expects a fixed length.
-                # We can simulate `while_loop` behavior within a `scan` by using `jax.lax.cond` or `jax.lax.while_loop`
-                # inside the scan body, but that's overly complex for this direct conversion.
-                # For `while_loop` with a dynamic termination condition, a `scan` over a maximum number of steps
-                # with conditional updates and then selecting the last valid state is one pattern.
-
-                def _cond_fun_while(carry_args: Tuple[Array, int, float, Array]) -> bool:
-                    _, index, mean_residual, _ = carry_args
-                    condition1 = mean_residual > residual_threshold
-                    condition2 = index < steps
-                    return jnp.logical_and(condition1, condition2)
-
-                def _body_func_while(carry_args: Tuple[Array, int, float, Array]) -> Tuple[Array, int, float, Array]:
-                    current_quantity, current_index, _, current_directional_derivative = carry_args
-                    quantity_out, rhs = self.do_integration_step(
-                        current_quantity, normal, mask, physical_simulation_time,
-                        fictitious_timestep_size, current_directional_derivative
-                    )
-                    denominator = jnp.sum(mask, axis=(-1,-2,-3))
-                    mean_residual = jnp.sum(jnp.abs(rhs), axis=(-1,-2,-3))
-                    if is_parallel:
-                        mean_residual = jax.lax.psum(mean_residual, axis_name="i")
-                        denominator = jax.lax.psum(denominator, axis_name="i")
-                    mean_residual = mean_residual/(denominator + 1e-30) 
-                    mean_residual = jnp.mean(mean_residual) # NOTE mean over primitives and phases
-                    return (quantity_out, current_index + 1, mean_residual, current_directional_derivative)
-
-                initial_carry_quantity = (quantity, 0, 1e10, directional_derivative)
-                final_carry_quantity = jax.lax.while_loop(_cond_fun_while, _body_func_while, initial_carry_quantity)
-                quantity = final_carry_quantity[0]
-                step_count = final_carry_quantity[1]
-
+            if debug:
+                quantity_buffer = jnp.zeros((steps+1,)+quantity.shape)
+                quantity = quantity_buffer.at[0].set(quantity)
+                directional_derivative = directional_derivative[-1] if linear_extension else None
+            args = (quantity, 0, 1e10, directional_derivative) # NOTE initial value for mean residual for while condition is hard coded to 1e10
+            args = jax.lax.while_loop(_cond_fun, _body_func, args)
+            step_count = args[1]
+            quantity = args[0]
 
         return quantity, step_count
 
@@ -427,3 +400,4 @@ class QuantityExtender:
         out = jnp.minimum(jnp.abs(array1), jnp.abs(array2))
         out *= mask
         return out
+        

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Any, Callable, Dict, Tuple, TYPE_CHECKING, NamedTuple
+from functools import partial
 
 import numpy as np
 
@@ -36,7 +37,7 @@ def initialize_fields_for_feedforward(
     nh = sim_manager.domain_information.nh_conservatives
     nhx, nhy, nhz = sim_manager.domain_information.domain_slices_conservatives
     split_factors = sim_manager.domain_information.split_factors
-    device_number_of_cells = sim_manager.domain_information.device_number_of_cells
+    # device_number_of_cells = 7
     equation_type = sim_manager.equation_information.equation_type
     no_primes = sim_manager.equation_information.no_primes
     levelset_model = sim_manager.equation_information.levelset_model
@@ -53,7 +54,7 @@ def initialize_fields_for_feedforward(
         leading_dim = no_primes
 
     # INITIALIZE MATERIAL FIELDS
-    primitives = create_field_buffer(nh, device_number_of_cells, dtype, leading_dim)
+    primitives = create_field_buffer(nh, sim_manager.domain_information.device_number_of_cells, dtype, leading_dim)
     primitives = primitives.at[..., nhx, nhy, nhz].set(primes_init)
     conservatives = sim_manager.equation_manager.get_conservatives_from_primitives(primitives)
     primitives, conservatives = sim_manager.halo_manager.perform_halo_update_material(
@@ -74,14 +75,14 @@ def initialize_fields_for_feedforward(
         ghost_cell_handler = levelset_handler.ghost_cell_handler
         interface_quantity_computer = levelset_handler.interface_quantity_computer
 
-        levelset = create_field_buffer(nh, device_number_of_cells, dtype)
+        levelset = create_field_buffer(nh, sim_manager.domain_information.device_number_of_cells, dtype)
         levelset = levelset.at[nhx, nhy, nhz].set(levelset_init)
         levelset = sim_manager.levelset_handler.reinitializer.set_levelset_cutoff(levelset)
         levelset = sim_manager.halo_manager.perform_halo_update_levelset(levelset, True, True)
         volume_fraction, apertures = sim_manager.levelset_handler.compute_volume_fraction_and_apertures(levelset)
 
         if levelset_model == "FLUID-SOLID-DYNAMIC-COUPLED":
-            interface_velocity = create_field_buffer(nh, device_number_of_cells, dtype, leading_dim=3)
+            interface_velocity = create_field_buffer(nh, sim_manager.domain_information.device_number_of_cells, dtype, leading_dim=3)
             interface_velocity = interface_velocity.at[...,nhx,nhy,nhz].set(solid_interface_velocity_init)
             solid_interface_velocity = interface_velocity[...,nhx,nhy,nhz]
             interface_pressure = None
@@ -97,11 +98,12 @@ def initialize_fields_for_feedforward(
             interface_velocity = None
             solid_interface_velocity = None
             interface_pressure = None
-           
+        
         normal = geometry_calculator.compute_normal(levelset)
+        steps = levelset_handler.levelset_setup.extension.steps_primes
         conservatives, primitives, *_ = ghost_cell_handler.perform_ghost_cell_treatment(
             conservatives, primitives, levelset, volume_fraction,
-            t_start, normal, solid_interface_velocity)
+            t_start, normal, solid_interface_velocity, steps=steps)
         primitives, conservatives = sim_manager.halo_manager.perform_halo_update_material(
             primitives, t_start, is_viscous_flux, False, conservatives)
 

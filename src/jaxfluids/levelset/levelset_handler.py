@@ -583,7 +583,8 @@ class LevelsetHandler():
             volume_fraction_new: Array,
             volume_fraction_old: Array,
             physical_simulation_time: Array,
-            solid_velocity: Array = None
+            solid_velocity: Array = None, 
+            is_feedforward:bool = False
             ) -> Tuple[Array, Array,
             LevelsetPositivityInformation]:
         """Treats the integrated material fields.
@@ -612,7 +613,6 @@ class LevelsetHandler():
         :rtype: Tuple[Array]
         """
 
-
         nhx, nhy, nhz = self.domain_information.domain_slices_conservatives
         levelset_model = self.equation_information.levelset_model
 
@@ -635,11 +635,12 @@ class LevelsetHandler():
         else:
             solid_velocity = None
 
+        steps = self.levelset_setup.extension.steps_primes if is_feedforward else None
         conservatives, primitives, extension_invalid_cell_count, extension_step_count = \
         self.ghost_cell_handler.perform_ghost_cell_treatment(
             conservatives, primitives, levelset, volume_fraction_new,
             physical_simulation_time, normal, solid_velocity,
-            invalid_cells)
+            invalid_cells, steps)
 
         levelset_positivity_info = LevelsetPositivityInformation(
             mixing_invalid_cell_count,

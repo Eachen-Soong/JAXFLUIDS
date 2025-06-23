@@ -328,6 +328,7 @@ class InterfaceQuantityComputer:
                 interface_pressure], axis=0)
             
             # EXTEND INTERFACE QUANTITIES
+            assert force_steps
             interface_quantities, step_count = self.extender_interface.extend(
                 interface_quantities, normal_extend, mask_extend,
                 0.0, CFL, steps, force_steps=force_steps)

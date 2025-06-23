@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 import numpy as np
+from copy import copy
 
 from jaxfluids.callbacks.base_callback import Callback
 from jaxfluids.data_types.buffers import ForcingBuffers, IntegrationBuffers, IntegrationBuffers, \
@@ -69,6 +70,11 @@ class SimulationManager:
         self.fixed_timestep = self.numerical_setup.conservatives.time_integration.fixed_timestep
         self.end_step = self.case_setup.general_setup.end_step
         self.end_time = self.case_setup.general_setup.end_time
+
+        # ADAPTATION: judge convergence and stop in advance
+        self.convergence_tol = self.case_setup.general_setup.convergence_tol
+        self.running_diff_cnt = self.case_setup.general_setup.running_diff_cnt
+        self.diff_buffer = []
 
         time_integrator = self.numerical_setup.conservatives.time_integration.integrator
         self.time_integrator: TimeIntegrator = time_integrator(
@@ -160,37 +166,37 @@ class SimulationManager:
                 halo_manager        = self.halo_manager,
                 logger              = self.logger,
                 output_writer       = self.output_writer)
+            
+    # def simulate(
+    #         self,
+    #         simulation_buffers: SimulationBuffers,
+    #         time_control_variables: TimeControlVariables,
+    #         forcing_parameters: ForcingParameters = ForcingParameters(),
+    #         ml_parameters_dict: Dict = None,
+    #         ml_networks_dict: Dict = None,
+    #         ) -> int:
+    #     """Performs a conventional CFD simulation.
 
-    def simulate(
-            self,
-            simulation_buffers: SimulationBuffers,
-            time_control_variables: TimeControlVariables,
-            forcing_parameters: ForcingParameters = ForcingParameters(),
-            ml_parameters_dict: Dict = None,
-            ml_networks_dict: Dict = None,
-            ) -> int:
-        """Performs a conventional CFD simulation.
-
-        :param simulation_buffers: _description_
-        :type simulation_buffers: SimulationBuffers
-        :param time_control_variables: _description_
-        :type time_control_variables: TimeControlVariables
-        :param forcing_parameters: _description_
-        :type forcing_parameters: ForcingParameters
-        :return: _description_
-        :rtype: _type_
-        """
-        self.initialize(
-            simulation_buffers,
-            time_control_variables,
-            forcing_parameters)
-        return_value = self.advance(
-            simulation_buffers,
-            time_control_variables,
-            forcing_parameters,
-            ml_parameters_dict,
-            ml_networks_dict)
-        return return_value
+    #     :param simulation_buffers: _description_
+    #     :type simulation_buffers: SimulationBuffers
+    #     :param time_control_variables: _description_
+    #     :type time_control_variables: TimeControlVariables
+    #     :param forcing_parameters: _description_
+    #     :type forcing_parameters: ForcingParameters
+    #     :return: _description_
+    #     :rtype: _type_
+    #     """
+    #     self.initialize(
+    #         simulation_buffers,
+    #         time_control_variables,
+    #         forcing_parameters)
+    #     return_value = self.advance(
+    #         simulation_buffers,
+    #         time_control_variables,
+    #         forcing_parameters,
+    #         ml_parameters_dict,
+    #         ml_networks_dict)
+    #     return return_value
 
     def initialize(
             self,
@@ -260,180 +266,205 @@ class SimulationManager:
             assert forcing_parameters is not None and not is_all_forcing_parameters_none, \
                 assert_string
 
-    def advance(
-            self,
-            simulation_buffers: SimulationBuffers,
-            time_control_variables: TimeControlVariables,
-            forcing_parameters: ForcingParameters = None,
-            ml_parameters_dict: Dict = None,
-            ml_networks_dict = None,
-            ) -> None:
-        """Advances the initial buffers in time.
+    def calc_rel_l2(self, buffer1: MaterialFieldBuffers, buffer2: MaterialFieldBuffers):
+        # primitives <KeysViewHDF5 ['density', 'pressure', 'velocity']>
+        if buffer1 is None or buffer2 is None:
+            return np.inf
+        loss = jnp.mean(jnp.square(buffer1.primitives-buffer2.primitives)) / jnp.mean(jnp.square(buffer1.primitives))
+        return loss
 
-        :param simulation_buffers: _description_
-        :type simulation_buffers: SimulationBuffers
-        :param time_control_variables: _description_
-        :type time_control_variables: TimeControlVariables
-        :param forcing_parameters: _description_, defaults to None
-        :type forcing_parameters: ForcingParameters, optional
-        :return: _description_
-        :rtype: _type_
-        """
+    # def advance(
+    #         self,
+    #         simulation_buffers: SimulationBuffers,
+    #         time_control_variables: TimeControlVariables,
+    #         forcing_parameters: ForcingParameters = None,
+    #         ml_parameters_dict: Dict = None,
+    #         ml_networks_dict = None,
+    #         ) -> None:
+    #     """Advances the initial buffers in time.
 
-        # LOG SIMULATION START
-        self.logger.log_sim_start()
+    #     :param simulation_buffers: _description_
+    #     :type simulation_buffers: SimulationBuffers
+    #     :param time_control_variables: _description_
+    #     :type time_control_variables: TimeControlVariables
+    #     :param forcing_parameters: _description_, defaults to None
+    #     :type forcing_parameters: ForcingParameters, optional
+    #     :return: _description_
+    #     :rtype: _type_
+    #     """
 
-        # START LOOP
-        start_loop = self.synchronize_and_clock(
-            simulation_buffers.material_fields.primitives)
+    #     # LOG SIMULATION START
+    #     self.logger.log_sim_start()
 
-        # CALLBACK on_simulation_start
-        # buffer_dictionary = self._callback("on_simulation_start",
-        #   buffer_dictionary=buffer_dictionary)
+    #     # START LOOP
+    #     start_loop = self.synchronize_and_clock(
+    #         simulation_buffers.material_fields.primitives)
 
-        physical_simulation_time = time_control_variables.physical_simulation_time
-        simulation_step = time_control_variables.simulation_step
+    #     # CALLBACK on_simulation_start
+    #     # buffer_dictionary = self._callback("on_simulation_start",
+    #     #   buffer_dictionary=buffer_dictionary)
 
-        wall_clock_times = WallClockTimes()
+    #     physical_simulation_time = time_control_variables.physical_simulation_time
+    #     simulation_step = time_control_variables.simulation_step
 
-        while physical_simulation_time < self.end_time and \
-            simulation_step < self.end_step:
+    #     wall_clock_times = WallClockTimes()
 
-            start_step = self.synchronize_and_clock(
-                simulation_buffers.material_fields.primitives)
+    #     convergence_flag = False
+    #     while (physical_simulation_time < self.end_time and \
+    #         simulation_step < self.end_step or convergence_flag) and not convergence_flag:
 
-            # COMPUTE REINITIALIZATION FLAG
-            if self.equation_information.levelset_model:
-                perform_reinitialization = \
-                self.levelset_handler.get_reinitialization_flag(
-                    time_control_variables.simulation_step)
-            else:
-                perform_reinitialization = None
+    #         prev_buffer = copy(simulation_buffers.material_fields)
+    #         start_step = self.synchronize_and_clock(
+    #             simulation_buffers.material_fields.primitives)
 
-            # COMPUTE INTERFACE COMPRESSION FLAG
-            if self.equation_information.diffuse_interface_model:
-                perform_compression = \
-                    self.diffuse_interface_handler.get_compression_flag(
-                        time_control_variables.simulation_step)
-            else:
-                perform_compression = None
+    #         # COMPUTE REINITIALIZATION FLAG
+    #         if self.equation_information.levelset_model:
+    #             perform_reinitialization = \
+    #             self.levelset_handler.get_reinitialization_flag(
+    #                 time_control_variables.simulation_step)
+    #         else:
+    #             perform_reinitialization = None
+
+    #         # COMPUTE INTERFACE COMPRESSION FLAG
+    #         if self.equation_information.diffuse_interface_model:
+    #             perform_compression = \
+    #                 self.diffuse_interface_handler.get_compression_flag(
+    #                     time_control_variables.simulation_step)
+    #         else:
+    #             perform_compression = None
             
-            # PERFORM INTEGRATION STEP
-            simulation_buffers, time_control_variables, \
-            forcing_parameters, step_information = \
-            self.do_integration_step(
-                simulation_buffers,
-                time_control_variables,
-                forcing_parameters,
-                perform_reinitialization,
-                perform_compression,
-                ml_parameters_dict,
-                ml_networks_dict)
+    #         # PERFORM INTEGRATION STEP
+    #         simulation_buffers, time_control_variables, \
+    #         forcing_parameters, step_information = \
+    #         self.do_integration_step(
+    #             simulation_buffers,
+    #             time_control_variables,
+    #             forcing_parameters,
+    #             perform_reinitialization,
+    #             perform_compression,
+    #             ml_parameters_dict,
+    #             ml_networks_dict)
 
-            # CLOCK INTEGRATION STEP
-            end_step = self.synchronize_and_clock(
-                simulation_buffers.material_fields.primitives)
-            wall_clock_step = end_step - start_step
+    #         # CLOCK INTEGRATION STEP
+    #         end_step = self.synchronize_and_clock(
+    #             simulation_buffers.material_fields.primitives)
+    #         wall_clock_step = end_step - start_step
 
-            # COMPUTE WALL CLOCK TIMES FOR TIME STEP
-            wall_clock_times = self.compute_wall_clock_time(
-                wall_clock_step, wall_clock_times,
-                time_control_variables.simulation_step)
+    #         # COMPUTE WALL CLOCK TIMES FOR TIME STEP
+    #         wall_clock_times = self.compute_wall_clock_time(
+    #             wall_clock_step, wall_clock_times,
+    #             time_control_variables.simulation_step)
 
-            # LOG TERMINAL END TIME STEP
-            self.logger.log_end_time_step(
-                time_control_variables, step_information,
-                wall_clock_times, self.unit_handler.time_reference)
-
-            # WRITE H5 OUTPUT
-            self.output_writer.write_output(
-                simulation_buffers, time_control_variables,
-                wall_clock_times, forcing_parameters)
-
-            # UNPACK FOR WHILE LOOP
-            physical_simulation_time = time_control_variables.physical_simulation_time
-            simulation_step = time_control_variables.simulation_step
-
-        # CALLBACK on_simulation_end
-        # buffer_dictionary = self._callback("on_simulation_end",
-        #   buffer_dictionary=buffer_dictionary)
-
-        # FINAL OUTPUT
-        self.output_writer.write_output(
-            simulation_buffers, time_control_variables,
-            wall_clock_times, forcing_parameters,
-            force_output=True, simulation_finish=True)
-
-        # LOG SIMULATION FINISH
-        end_loop = self.synchronize_and_clock(
-            simulation_buffers.material_fields.primitives)
-        self.logger.log_sim_finish(end_loop - start_loop)
-
-        return bool(physical_simulation_time >= self.end_time)
-
-    def compute_wall_clock_time(
-            self,
-            wall_clock_step: float,
-            wall_clock_times: WallClockTimes,
-            simulation_step: jnp.int32
-            ) -> WallClockTimes:
-        """Computes the instantaneous 
-        and mean wall clock time for the
-        a single simulation steps.
-
-        :param wall_clock_step: _description_
-        :type wall_clock_step: float
-        :param simulation_step: _description_
-        :type simulation_step: jnp.int32
-        :param wall_clock_times: _description_
-        :type wall_clock_times: WallClockTimes
-        :return: _description_
-        :rtype: WallClockTimes
-        """
-        offset = 10
-        cells_per_device = self.domain_information.cells_per_device
-        if simulation_step >= offset:
-            mean_wall_clock_step = wall_clock_times.mean_step
-            mean_wall_clock_step_cell = wall_clock_times.mean_step_per_cell
-            wall_clock_step_cell = wall_clock_step / cells_per_device
-            mean_wall_clock_step = (wall_clock_step + mean_wall_clock_step * (simulation_step - offset)) / (simulation_step - offset + 1)
-            mean_wall_clock_step_cell = (wall_clock_step_cell + mean_wall_clock_step_cell * (simulation_step - offset)) / (simulation_step - offset + 1)
-        else:
-            wall_clock_step_cell = wall_clock_step / cells_per_device
-            mean_wall_clock_step = wall_clock_step
-            mean_wall_clock_step_cell = wall_clock_step_cell
-
-        wall_clock_times = WallClockTimes(
-            wall_clock_step, wall_clock_step_cell,
-            mean_wall_clock_step, mean_wall_clock_step_cell)
+    #         diff = self.calc_rel_l2(prev_buffer, simulation_buffers.material_fields)
+    #         self.diff_buffer.append(diff)
+    #         if len(self.diff_buffer) >= self.running_diff_cnt:
+    #             self.diff_buffer.pop(0)
+    #         running_diff = sum(self.diff_buffer) / len(self.diff_buffer)
+    #         self.output_writer.hdf5_writer.diff = running_diff
             
-        return wall_clock_times
+    #         convergence_flag = (running_diff <= self.convergence_tol)
+    #         print(f"diff: {diff}; running_diff: {running_diff}")
 
-    def synchronize_and_clock(
-            self,
-            buffer: Array,
-            all_reduce: bool = False
-            ) -> float:
-        """Synchronizes jax and python by blocking
-        python until the input buffer is ready.
-        For multi-host simulations, subsequently
-        performs a all-reduce operation to
-        synchronize all hosts. 
+    #         # LOG TERMINAL END TIME STEP
+    #         self.logger.log_end_time_step(
+    #             time_control_variables, step_information,
+    #             wall_clock_times, self.unit_handler.time_reference)
 
-        :param buffer: _description_, defaults to True
-        :type buffer: _type_, optional
-        :return: _description_
-        :rtype: float
-        """
-        buffer.block_until_ready()
-        if self.domain_information.is_multihost and all_reduce:
-            local_device_count = self.domain_information.local_device_count
-            host_sync_buffer = np.ones(local_device_count)
-            host_sync_buffer = jax.pmap(lambda x: jax.lax.psum(x, axis_name="i"),
-                axis_name="i")(host_sync_buffer)
-            host_sync_buffer.block_until_ready()
-        return time.time()
-    
+    #         # WRITE H5 OUTPUT
+    #         self.output_writer.write_output(
+    #             simulation_buffers, time_control_variables,
+    #             wall_clock_times, forcing_parameters)
+
+    #         # UNPACK FOR WHILE LOOP
+    #         physical_simulation_time = time_control_variables.physical_simulation_time
+    #         simulation_step = time_control_variables.simulation_step
+
+
+    #     # CALLBACK on_simulation_end
+    #     # buffer_dictionary = self._callback("on_simulation_end",
+    #     #                                         buffer_dictionary=buffer_dictionary)
+    #     self.diff_buffer.append(diff)
+    #     if len(self.diff_buffer) >= self.running_diff_cnt:
+    #         self.diff_buffer.pop(0)
+    #     running_diff = sum(self.diff_buffer) / len(self.diff_buffer)
+    #     self.output_writer.hdf5_writer.diff = running_diff
+
+    #     # FINAL OUTPUT
+    #     self.output_writer.write_output(
+    #         simulation_buffers, time_control_variables,
+    #         wall_clock_times, forcing_parameters,
+    #         force_output=True, simulation_finish=True)
+
+    #     # LOG SIMULATION FINISH
+    #     end_loop = self.synchronize_and_clock(
+    #         simulation_buffers.material_fields.primitives)
+    #     self.logger.log_sim_finish(end_loop - start_loop)
+
+    #     return bool(physical_simulation_time >= self.end_time)
+
+    # def compute_wall_clock_time(
+    #         self,
+    #         wall_clock_step: float,
+    #         wall_clock_times: WallClockTimes,
+    #         simulation_step: jnp.int32
+    #         ) -> WallClockTimes:
+    #     """Computes the instantaneous 
+    #     and mean wall clock time for the
+    #     a single simulation steps.
+
+    #     :param wall_clock_step: _description_
+    #     :type wall_clock_step: float
+    #     :param simulation_step: _description_
+    #     :type simulation_step: jnp.int32
+    #     :param wall_clock_times: _description_
+    #     :type wall_clock_times: WallClockTimes
+    #     :return: _description_
+    #     :rtype: WallClockTimes
+    #     """
+    #     offset = 10
+    #     cells_per_device = self.domain_information.cells_per_device
+    #     if simulation_step >= offset:
+    #         mean_wall_clock_step = wall_clock_times.mean_step
+    #         mean_wall_clock_step_cell = wall_clock_times.mean_step_per_cell
+    #         wall_clock_step_cell = wall_clock_step / cells_per_device
+    #         mean_wall_clock_step = (wall_clock_step + mean_wall_clock_step * (simulation_step - offset)) / (simulation_step - offset + 1)
+    #         mean_wall_clock_step_cell = (wall_clock_step_cell + mean_wall_clock_step_cell * (simulation_step - offset)) / (simulation_step - offset + 1)
+    #     else:
+    #         wall_clock_step_cell = wall_clock_step / cells_per_device
+    #         mean_wall_clock_step = wall_clock_step
+    #         mean_wall_clock_step_cell = wall_clock_step_cell
+
+    #     wall_clock_times = WallClockTimes(
+    #         wall_clock_step, wall_clock_step_cell,
+    #         mean_wall_clock_step, mean_wall_clock_step_cell)
+            
+    #     return wall_clock_times
+
+    # def synchronize_and_clock(
+    #         self,
+    #         buffer: Array,
+    #         all_reduce: bool = False
+    #         ) -> float:
+    #     """Synchronizes jax and python by blocking
+    #     python until the input buffer is ready.
+    #     For multi-host simulations, subsequently
+    #     performs a all-reduce operation to
+    #     synchronize all hosts. 
+
+    #     :param buffer: _description_, defaults to True
+    #     :type buffer: _type_, optional
+    #     :return: _description_
+    #     :rtype: float
+    #     """
+    #     buffer.block_until_ready()
+    #     if self.domain_information.is_multihost and all_reduce:
+    #         local_device_count = self.domain_information.local_device_count
+    #         host_sync_buffer = np.ones(local_device_count)
+    #         host_sync_buffer = jax.pmap(lambda x: jax.lax.psum(x, axis_name="i"),
+    #             axis_name="i")(host_sync_buffer)
+    #         host_sync_buffer.block_until_ready()
+    #     return time.time()
+
     def _do_integration_step(
             self,
             simulation_buffers: SimulationBuffers,
@@ -490,7 +521,7 @@ class SimulationManager:
             forcing_buffers, forcing_parameters, \
             forcing_infos = self.forcings_computer.compute_forcings(
                 simulation_buffers, time_control_variables,
-                forcing_parameters, partial(self.do_runge_kutta_stages, is_feedforward=is_feedforward),
+                forcing_parameters, self.do_runge_kutta_stages,
                 ml_parameters_dict=ml_parameters_dict,
                 ml_networks_dict=ml_networks_dict)
         else:
@@ -520,7 +551,6 @@ class SimulationManager:
         return simulation_buffers, time_control_variables, \
             forcing_parameters, step_information
 
-    # @partial(jax.jit, static_argnums=(0,9))
     def do_runge_kutta_stages(
             self,
             material_fields: MaterialFieldBuffers,
@@ -662,7 +692,7 @@ class SimulationManager:
                 prime_extension_step_count = self.levelset_handler.treat_integrated_material_fields(
                     conservatives, primitives, levelset,
                     volume_fraction_new, volume_fraction,
-                    current_time_stage, interface_velocity, is_feedforward)
+                    current_time_stage, interface_velocity)
                 volume_fraction = volume_fraction_new
             else:
                 primitives = self.equation_manager.get_primitives_from_conservatives(
@@ -783,7 +813,7 @@ class SimulationManager:
             initial_stage_buffers = None
 
         return initial_stage_buffers
-    @partial(jax.jit, static_argnums=(0,5))
+    
     def perform_stage_integration(
             self,
             integration_buffers: IntegrationBuffers,
@@ -861,7 +891,6 @@ class SimulationManager:
 
         return integration_buffers
 
-    @partial(jax.jit, static_argnums=(0,))
     def compute_timestep(
             self,
             primitives: Array,
@@ -1123,7 +1152,7 @@ class SimulationManager:
         :param n_steps: Number of integration steps
         :type n_steps: int
         :param physical_timestep_size: Physical time step size
-        :type physical_timestep_size: float
+        :type physical_timestep_size: Array
         :param t_start: Physical start time
         :type t_start: float
         :param output_freq: Frequency in time steps for output, defaults to 1
@@ -1135,12 +1164,94 @@ class SimulationManager:
         :return: _description_
         :rtype: Tuple[Array, Array]
         """
+        # @jax.jit
+        @partial(jax.jit, static_argnames=["outer_steps", "inner_steps", "is_scan", "is_checkpoint", "is_include_t0"])
+        def _feed_forward(
+                primes_init: Array,
+                physical_timestep_size: float,
+                t_start: float,
+                outer_steps: int,
+                inner_steps: int = 1,
+                is_scan: bool = True,
+                is_checkpoint: bool = True,
+                is_include_t0: bool = True,
+                levelset_init: Array = None,
+                solid_interface_velocity_init: Array = None,
+                ml_parameters_dict: Union[Dict, None] = None,
+                ml_networks_dict: Union[Dict, None] = None
+            ) -> Tuple[Array, Array]:
+            """Advances the initial buffers in time for a fixed amount of steps and returns the
+            entire trajectory. This function is differentiable and
+            must therefore be used to end-to-end optimize ML models within the JAX-FLUIDS simulator.
 
-        return jax.vmap(
-                self._feed_forward,
-                in_axes=(0,0,None,None,None,None,None,None,0,0,None,None),
-                out_axes=(0,0,))(
-            batch_primes_init,
+            :param primes_init: Initial primitive variables buffer
+            :type primes_init: Array
+            :param levelset_init: Initial levelset buffer
+            :type levelset_init: Array
+            :param n_steps: Number of time steps
+            :type n_steps: int
+            :param physical_timestep_size: Physical time step size
+            :type physical_timestep_size: float
+            :param t_start: Physical start time
+            :type t_start: float
+            :param output_freq: Frequency in time steps for output, defaults to 1
+            :type output_freq: int, optional
+            :param ml_parameters_dict: _description_, defaults to None
+            :type ml_parameters_dict: Union[Dict, None], optional
+            :param ml_networks_dict: _description_, defaults to None
+            :type ml_networks_dict: Union[Dict, None], optional
+            :return: _description_
+            :rtype: Tuple[Array, Array]
+            """
+            # return jnp.zeros((1,1)), jnp.zeros((1,)) 
+        
+            def post_process_fn(simulation_buffers: SimulationBuffers
+                ) -> Tuple[Array]:
+                # TODO @dbezgin should be user input???
+                nhx,nhy,nhz = self.domain_information.domain_slices_conservatives
+                nhx_,nhy_,nhz_ = self.domain_information.domain_slices_geometry
+                material_fields = simulation_buffers.material_fields
+                levelset_fields = simulation_buffers.levelset_fields
+
+                primitives = material_fields.primitives
+                volume_fraction = levelset_fields.volume_fraction
+                levelset = levelset_fields.levelset
+
+                if self.equation_information.levelset_model:
+                    out_buffer = (
+                        primitives[...,nhx,nhy,nhz], 
+                        levelset[nhx,nhy,nhz],
+                        volume_fraction[nhx_,nhy_,nhz_],)
+                else:
+                    out_buffer = (primitives[:,nhx,nhy,nhz],)
+                return out_buffer
+
+            multistep = configure_multistep(
+                do_integration_step_fn=self._do_integration_step,
+                post_process_fn=post_process_fn,
+                outer_steps=outer_steps, inner_steps=inner_steps,
+                is_scan=is_scan, is_checkpoint=is_checkpoint,
+                is_include_t0=is_include_t0, ml_networks_dict=ml_networks_dict)
+
+            simulation_buffers, time_control_variables, \
+            forcing_parameters = initialize_fields_for_feedforward(
+                sim_manager=self, primes_init=primes_init,
+                physical_timestep_size=physical_timestep_size, t_start=t_start,
+                levelset_init=levelset_init,
+                solid_interface_velocity_init=solid_interface_velocity_init)
+
+            solution_array, times_array = multistep(
+                simulation_buffers, time_control_variables,
+                forcing_parameters, ml_parameters_dict)
+
+            return solution_array, times_array
+        
+
+        return jax.vmap(_feed_forward,
+            in_axes=(0,0,None,None,None,None,None,None,0,0,None,None),
+            out_axes=(0,0),
+        )(
+            batch_primes_init,     
             physical_timestep_size,
             t_start,
             outer_steps,
@@ -1149,97 +1260,45 @@ class SimulationManager:
             is_checkpoint,
             is_include_t0,
             batch_levelset_init,
-            batch_solid_interface_velocity_init,
+            batch_solid_interface_velocity_init, 
             ml_parameters_dict,
-            ml_networks_dict)
+            ml_networks_dict,
+            )
 
-    def _feed_forward(
-            self, 
-            primes_init: Array, 
-            physical_timestep_size: float, 
-            t_start: float, 
-            outer_steps: int, 
-            inner_steps: int = 1,
-            is_scan: bool = True,
-            is_checkpoint: bool = True,
-            is_include_t0: bool = True,
-            levelset_init: Array = None,   
-            solid_interface_velocity_init: Array = None,   
-            ml_parameters_dict: Union[Dict, None] = None,
-            ml_networks_dict: Union[Dict, None] = None
-        ) -> Tuple[Array, Array]:
-        """Advances the initial buffers in time for a fixed amount of steps and returns the
-        entire trajectory. This function is differentiable and
-        must therefore be used to end-to-end optimize ML models within the JAX-FLUIDS simulator.
+        # vmap_fn = jax.vmap(partial(_feed_forward, outer_steps=outer_steps, inner_steps=inner_steps, is_scan=is_scan, is_checkpoint=is_checkpoint, is_include_t0=is_include_t0),
+        #                     in_axes=(0,0,None,0,0,None,None),
+        #                     out_axes=(0,0),
+        #                     )
+        
+        # return vmap_fn(
+        #     batch_primes_init,     
+        #     physical_timestep_size,
+        #     t_start,
+        #     batch_levelset_init,
+        #     batch_solid_interface_velocity_init, 
+        #     ml_parameters_dict,
+        #     ml_networks_dict,
+        #     )
 
-        :param primes_init: Initial primitive variables buffer
-        :type primes_init: Array
-        :param levelset_init: Initial levelset buffer
-        :type levelset_init: Array
-        :param n_steps: Number of time steps
-        :type n_steps: int
-        :param physical_timestep_size: Physical time step size
-        :type physical_timestep_size: float
-        :param t_start: Physical start time
-        :type t_start: float
-        :param output_freq: Frequency in time steps for output, defaults to 1
-        :type output_freq: int, optional
-        :param ml_parameters_dict: _description_, defaults to None
-        :type ml_parameters_dict: Union[Dict, None], optional
-        :param ml_networks_dict: _description_, defaults to None
-        :type ml_networks_dict: Union[Dict, None], optional
-        :return: _description_
-        :rtype: Tuple[Array, Array]
-        """
-        # return primes_init, physical_timestep_size
 
-        def post_process_fn(simulation_buffers: SimulationBuffers
-            ) -> Tuple[Array]:
-            # TODO @dbezgin should be user input???
-            nhx,nhy,nhz = self.domain_information.domain_slices_conservatives
-            nhx_,nhy_,nhz_ = self.domain_information.domain_slices_geometry
-            material_fields = simulation_buffers.material_fields
-            levelset_fields = simulation_buffers.levelset_fields
+        # single_primes_init = batch_primes_init[0]
+        # simgle_physical_timestep_size = physical_timestep_size[0]
+        # single_levelset_init = batch_levelset_init[0] if batch_levelset_init is not None else None
+        # single_solid_interface_velocity_init = batch_solid_interface_velocity_init[0] if batch_solid_interface_velocity_init is not None else None
 
-            primitives = material_fields.primitives
-            volume_fraction = levelset_fields.volume_fraction
-            levelset = levelset_fields.levelset
-
-            if self.equation_information.levelset_model:
-                out_buffer = (
-                    primitives[...,nhx,nhy,nhz], 
-                    levelset[nhx,nhy,nhz],
-                    volume_fraction[nhx_,nhy_,nhz_],)
-            else:
-                out_buffer = (primitives[:,nhx,nhy,nhz],)
-            return out_buffer
-
-        multistep = configure_multistep(
-            do_integration_step_fn=self._do_integration_step,
-            post_process_fn=post_process_fn,
-            outer_steps=outer_steps, inner_steps=inner_steps,
-            is_scan=is_scan, is_checkpoint=is_checkpoint,
-            is_include_t0=is_include_t0, ml_networks_dict=ml_networks_dict)
-
-        simulation_buffers, time_control_variables, \
-        forcing_parameters = initialize_fields_for_feedforward(
-            sim_manager=self, primes_init=primes_init,
-            physical_timestep_size=physical_timestep_size, t_start=t_start,
-            levelset_init=levelset_init,
-            solid_interface_velocity_init=solid_interface_velocity_init)
+        # return _feed_forward(
+        #     single_primes_init,
+        #     simgle_physical_timestep_size,
+        #     t_start,
+        #     outer_steps,
+        #     inner_steps,
+        #     is_scan,
+        #     is_checkpoint,
+        #     is_include_t0,
+        #     single_levelset_init,
+        #     single_solid_interface_velocity_init,
+        #     ml_parameters_dict,
+        #     ml_networks_dict,
+        # )
 
         
-        return post_process_fn(simulation_buffers)[0], physical_timestep_size
-
-        return post_process_fn(self._do_integration_step(
-                simulation_buffers, time_control_variables, forcing_parameters,
-                False, False, ml_parameters_dict, ml_networks_dict, True
-                )[0])[0], physical_timestep_size
-
-        solution_array, times_array = multistep(
-            simulation_buffers, time_control_variables,
-            forcing_parameters, ml_parameters_dict)
-
-        return solution_array, 
-        
-    # def regularize_input(self, )
