@@ -132,7 +132,6 @@ class QuantityExtender:
         :return: _description_
         :rtype: Tuple[Array, float]
         """
-        assert force_steps
 
         is_jaxforloop = self.extension_setup.is_jaxforloop
         is_jaxhileloop = self.extension_setup.is_jaxhileloop

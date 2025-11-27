@@ -1,6 +1,7 @@
 from functools import partial
 import time
 from typing import List, Tuple, Union, Dict
+from copy import copy
 
 import jax
 import jax.numpy as jnp
@@ -74,6 +75,11 @@ class SimulationManager:
         self.time_integrator: TimeIntegrator = time_integrator(
             nh = self.domain_information.nh_conservatives,
             inactive_axes = self.domain_information.inactive_axes)
+        
+        # ADAPTATION: judge convergence and stop in advance
+        self.convergence_tol = self.case_setup.general_setup.convergence_tol
+        self.running_diff_cnt = self.case_setup.general_setup.running_diff_cnt
+        self.diff_buffer = []
         
         # LEVELSET HANDLER
         if self.equation_information.levelset_model:
@@ -259,6 +265,13 @@ class SimulationManager:
             is_all_forcing_parameters_none = all(map(lambda x: x is None, forcing_parameters))
             assert forcing_parameters is not None and not is_all_forcing_parameters_none, \
                 assert_string
+    
+    def calc_rel_l2(self, buffer1: MaterialFieldBuffers, buffer2: MaterialFieldBuffers):
+        # primitives <KeysViewHDF5 ['density', 'pressure', 'velocity']>
+        if buffer1 is None or buffer2 is None:
+            return np.inf
+        loss = jnp.mean(jnp.square(buffer1.primitives-buffer2.primitives)) / jnp.mean(jnp.square(buffer1.primitives))
+        return loss
 
     def advance(
             self,
@@ -296,9 +309,11 @@ class SimulationManager:
 
         wall_clock_times = WallClockTimes()
 
-        while physical_simulation_time < self.end_time and \
-            simulation_step < self.end_step:
+        convergence_flag = False
+        while (physical_simulation_time < self.end_time and \
+            simulation_step < self.end_step or convergence_flag) and not convergence_flag:
 
+            prev_buffer = copy(simulation_buffers.material_fields)
             start_step = self.synchronize_and_clock(
                 simulation_buffers.material_fields.primitives)
 
@@ -340,6 +355,16 @@ class SimulationManager:
                 wall_clock_step, wall_clock_times,
                 time_control_variables.simulation_step)
 
+            diff = self.calc_rel_l2(prev_buffer, simulation_buffers.material_fields)
+            self.diff_buffer.append(diff)
+            if len(self.diff_buffer) >= self.running_diff_cnt:
+                self.diff_buffer.pop(0)
+            running_diff = sum(self.diff_buffer) / len(self.diff_buffer)
+            self.output_writer.hdf5_writer.diff = running_diff
+            
+            convergence_flag = (running_diff <= self.convergence_tol)
+            print(f"diff: {diff}; running_diff: {running_diff}")
+
             # LOG TERMINAL END TIME STEP
             self.logger.log_end_time_step(
                 time_control_variables, step_information,
@@ -354,9 +379,15 @@ class SimulationManager:
             physical_simulation_time = time_control_variables.physical_simulation_time
             simulation_step = time_control_variables.simulation_step
 
+
         # CALLBACK on_simulation_end
         # buffer_dictionary = self._callback("on_simulation_end",
-        #   buffer_dictionary=buffer_dictionary)
+        #                                         buffer_dictionary=buffer_dictionary)
+        self.diff_buffer.append(diff)
+        if len(self.diff_buffer) >= self.running_diff_cnt:
+            self.diff_buffer.pop(0)
+        running_diff = sum(self.diff_buffer) / len(self.diff_buffer)
+        self.output_writer.hdf5_writer.diff = running_diff
 
         # FINAL OUTPUT
         self.output_writer.write_output(
@@ -370,7 +401,7 @@ class SimulationManager:
         self.logger.log_sim_finish(end_loop - start_loop)
 
         return bool(physical_simulation_time >= self.end_time)
-
+    
     def compute_wall_clock_time(
             self,
             wall_clock_step: float,
@@ -783,7 +814,7 @@ class SimulationManager:
             initial_stage_buffers = None
 
         return initial_stage_buffers
-    @partial(jax.jit, static_argnums=(0,5))
+    # @partial(jax.jit, static_argnums=(0,5))
     def perform_stage_integration(
             self,
             integration_buffers: IntegrationBuffers,
@@ -861,7 +892,7 @@ class SimulationManager:
 
         return integration_buffers
 
-    @partial(jax.jit, static_argnums=(0,))
+    # @partial(jax.jit, static_argnums=(0,))
     def compute_timestep(
             self,
             primitives: Array,
